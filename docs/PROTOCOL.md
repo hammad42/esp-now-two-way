@@ -1,44 +1,51 @@
 # Wire protocol
 
-A small fixed-size struct sent as the ESP-NOW payload. Both boards run the same code, so
-there is no client and no server — either side may speak first.
+Version 2. A fixed 20-byte header followed by 0–200 bytes of payload whose meaning
+depends on the message type. Only `sizeof(header) + payload_len` bytes are transmitted,
+so a HELLO costs 20 bytes on the air and a full chat line costs 220 — comfortably inside
+the 250-byte ESP-NOW limit.
 
-## Frame
+Both boards run the same code, so there is no client and no server: either side may speak
+first, and both keep their own sequence numbers.
 
-`espnow_message_t`, 22 bytes, `__attribute__((packed))`, little-endian (both ends are
-Xtensa/RISC-V, so no byte swapping is needed):
+## Header
+
+`espnow_header_t`, `__attribute__((packed))`, little-endian (both ends are Xtensa or
+RISC-V, so no byte swapping is needed):
 
 | Offset | Field | Type | Meaning |
 | --- | --- | --- | --- |
-| 0 | `version` | `uint8_t` | Protocol version, currently `1`. Frames with another version are dropped |
-| 1 | `type` | `uint8_t` | `0` HELLO, `1` DATA, `2` ACK |
-| 2 | `seq` | `uint32_t` | Sequence number of a DATA frame; an ACK echoes the number it answers |
-| 6 | `uptime_ms` | `uint32_t` | Sender `millis()` at transmit time |
-| 10 | `value` | `float` | Application payload — replace with your own reading |
-| 14 | `name` | `char[8]` | Sender `NODE_NAME`, NUL padded |
+| 0 | `version` | `uint8_t` | `2`. Frames with another version are dropped |
+| 1 | `type` | `uint8_t` | `0` HELLO, `1` DATA, `2` ACK, `3` TEXT, `4` CMD |
+| 2 | `flags` | `uint8_t` | `0x01` needs ACK, `0x02` is a retransmission |
+| 3 | `payload_len` | `uint8_t` | Payload bytes that follow, 0–200 |
+| 4 | `seq` | `uint32_t` | Per-sender counter; an ACK echoes the number it answers |
+| 8 | `uptime_ms` | `uint32_t` | Sender `millis()` at transmit time |
+| 12 | `name` | `char[8]` | Sender `NODE_NAME`, NUL padded |
 
-The receiver drops anything whose length is not exactly `sizeof(espnow_message_t)`, which
-keeps unrelated ESP-NOW traffic on the same channel out of the way.
+A receiver drops anything shorter than the header, longer than a full frame, or whose
+`payload_len` disagrees with the actual length. That keeps unrelated ESP-NOW traffic on
+the same channel out of the way, and means the payload length can be trusted afterwards.
 
 ## Message types
 
-**HELLO (0)** — sent to `FF:FF:FF:FF:FF:FF` while no peer is known, once per
-`SEND_INTERVAL_MS`. A node that receives a HELLO registers the sender as its peer, and
-replies with a unicast HELLO **only if it was not already paired**. That condition is
-what terminates the exchange: an unconditional reply leaves the two nodes answering each
-other's HELLOs forever. `seq` is unused.
+| Type | Payload | Acked | Purpose |
+| --- | --- | --- | --- |
+| `HELLO` | none | no | Discovery. Broadcast while unpaired, then answered unicast |
+| `DATA` | `float value` | yes | The periodic reading |
+| `ACK` | none | no | Answers one acked frame; `seq` echoes it |
+| `TEXT` | UTF-8 bytes, not terminated | yes | A chat line typed at the console |
+| `CMD` | `uint8_t cmd, uint8_t arg` | yes | Remote LED control: on, off, blink ×`arg`, identify |
 
-If a node that is already paired hears a HELLO from a partner that rebooted, it stays
-silent — and the rebooted node re-pairs anyway from the next DATA frame it receives,
-since DATA also registers its sender.
+`TEXT` payloads are not NUL-terminated on the air; the receiver terminates them using
+`payload_len` before printing.
 
-**DATA (1)** — unicast to the paired peer, `seq` incrementing from 1. Carries `value`
-and `uptime_ms`.
+## Discovery
 
-**ACK (2)** — unicast reply to a DATA frame, echoing its `seq`. The originator subtracts
-its send timestamp from `millis()` on arrival to get the round-trip time.
-
-## Sequence
+While no peer is known, a node broadcasts a HELLO once per interval. A node that receives
+one registers the sender and replies with a **unicast** HELLO **only if it was not
+already paired**. That condition is what terminates the exchange: an unconditional reply
+leaves the two nodes answering each other's HELLOs forever.
 
 ```
 A                                   B
@@ -47,43 +54,62 @@ A                                   B
 |--- HELLO (unicast) -------------->|   B is already paired -> silent, exchange ends
 |                                   |
 |--- DATA seq=1 ------------------->|
-|<-- ACK  seq=1 --------------------|   A prints rtt
+|<-- ACK  seq=1 --------------------|   A prints the round-trip time
 |                                   |
-|<-- DATA seq=1 --------------------|   B runs the same loop
+|<-- DATA seq=1 --------------------|   B runs the same loop, its own sequence
 |--- ACK  seq=1 ------------------->|
 ```
 
-Both nodes transmit on their own timer, so the two directions are independent — the link
-is genuinely symmetric rather than request/response.
+A node that is already paired stays silent when a rebooted partner broadcasts HELLO — and
+the rebooted node re-pairs anyway from the next DATA frame it receives, because DATA also
+registers its sender.
 
-## Delivery guarantees
+Both nodes transmit on their own timer, so the two directions are independent: the link is
+genuinely symmetric rather than request/response.
 
-There are two separate notions of "delivered":
+## Reliability
 
-1. **Radio ACK** — reported by the ESP-NOW send callback. It means the peer's radio
-   received the frame at the 802.11 layer. It is not reported for broadcast frames, which
-   always come back as success.
-2. **Application ACK** — the `MSG_ACK` frame. It is the only evidence that the peer's
-   firmware parsed the message.
+Messages carrying `FLAG_NEEDS_ACK` are sent **one at a time**. The sender keeps the frame
+until the matching ACK arrives; if `ACK_TIMEOUT_MS` passes it sets `FLAG_RETRY` and sends
+it again, up to `RETRY_MAX` attempts in total, then gives the message up and counts it as
+lost. Messages queued in the meantime wait their turn in the outbox, which is what the
+`outbox full` warning refers to.
 
-Neither is retried. A lost DATA frame simply leaves a gap in the sequence numbers, which
-is visible in the log. If your application needs reliability, retransmit on a missing ACK
-and de-duplicate on `seq` at the receiver.
+A link-layer failure short-circuits the timeout: when the radio reports that a frame was
+not acknowledged at the 802.11 layer, no application reply can be coming, so the retry
+happens immediately rather than `ACK_TIMEOUT_MS` later.
 
-Radio failures are counted consecutively: `PEER_LOST_AFTER_FAILURES` in a row and the
-node deletes the peer and goes back to discovery. A single success resets the count.
+Two separate notions of "delivered" are therefore visible in `stats`:
 
-The round-trip time is only printed when the ACK matches the most recent DATA sequence;
-a late ACK arriving after the next DATA has gone out is logged without a timing figure,
-because the sketch keeps one send timestamp rather than one per outstanding frame.
+1. **Radio ok/fail** — from the ESP-NOW send callback. The peer's radio received the
+   frame. It is not meaningful for broadcasts, which always report success.
+2. **Acked** — the `MSG_ACK` frame came back. This is the only evidence that the peer's
+   firmware parsed the message, and it is what the RTT is measured from.
+
+The receiver **acknowledges before de-duplicating**. A retransmission normally means the
+original ACK was the frame that got lost, so it must be answered again — but it is then
+discarded rather than acted on twice, by comparing `seq` with the last acked sequence
+from that peer. Re-running a `led on` command or printing a chat line twice would
+otherwise be visible to the user.
+
+Sequence numbers are per sender and only assigned to acked messages, so an ACK's echoed
+`seq` never disturbs the de-duplication state. They wrap after 2³² messages, which at the
+default interval is about 270 years.
+
+The round-trip time is measured from the **last attempt**, not the first, and only when
+the ACK matches the outstanding sequence number; a late ACK arriving after the sender has
+moved on is logged without a timing figure.
 
 ## Extending it
 
-- Raise the payload: anything up to 250 bytes fits in one frame. Add fields to the end of
-  the struct and bump `PROTO_VERSION`.
-- More than two nodes: `peerKnown` holds a single peer today. Replace it with an array
-  (ESP-NOW allows 20 peers) and keep the HELLO exchange as-is — it already works
-  many-to-many, since HELLOs are broadcast.
+- Bigger payloads: up to 200 bytes fit today, and the cap is just `ESPNOW_MAX_PAYLOAD`
+  against the 250-byte ESP-NOW frame limit. Add fields to a payload struct and bump
+  `PROTO_VERSION` — mismatched versions are dropped rather than misparsed.
+- A new message type: add it to the `MSG_*` enum, give it a payload struct, and handle it
+  in `handleFrame()`. Set `FLAG_NEEDS_ACK` if losing it would matter.
+- More than two nodes: `peerKnown` holds a single partner today. Replace it with an array
+  (ESP-NOW allows 20 peers) and give each peer its own `lastRxSeq` and outstanding frame.
+  The HELLO exchange already works many-to-many, since HELLOs are broadcast.
 - Encryption: set `ENABLE_ENCRYPTION` to `1` and change the PMK/LMK in `peer_config.h`.
   The PMK is shared by the whole network, the LMK is per peer, both are 16 bytes, and at
   most 6 peers may be encrypted. Broadcast HELLOs stay in plaintext by design.

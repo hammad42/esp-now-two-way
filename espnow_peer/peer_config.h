@@ -18,8 +18,23 @@
  * ------------------------------------------------------------------------ */
 #define ESPNOW_CHANNEL 1
 
-/* How often a node transmits, in milliseconds. */
+/* How often a node transmits its reading, in milliseconds. Changeable at
+ * runtime with the "interval" console command. */
 #define SEND_INTERVAL_MS 2000
+
+/* ---------------------------------------------------------------------------
+ * Reliability
+ * A message that asks for an ACK is retransmitted until one arrives or the
+ * attempts run out. RETRY_MAX counts every attempt, the first one included, so
+ * 3 means one send and two retries.
+ * ------------------------------------------------------------------------ */
+#define ACK_TIMEOUT_MS 300
+#define RETRY_MAX      3
+
+/* Buffered frames. Received frames wait here for loop() to handle them, and
+ * outgoing messages wait for the previous one to be acknowledged. */
+#define RX_QUEUE_DEPTH 8
+#define TX_QUEUE_DEPTH 4
 
 /* ---------------------------------------------------------------------------
  * Peering
@@ -31,9 +46,10 @@
 #define PEER_AUTO_DISCOVER 1
 #define PEER_MAC_ADDRESS { 0x24, 0x6F, 0x28, 0x00, 0x00, 0x00 }
 
-/* Consecutive frames the radio fails to deliver before the partner is treated
- * as gone: the peer is removed and the node goes back to broadcasting HELLO. */
-#define PEER_LOST_AFTER_FAILURES 5
+/* Messages given up on in a row - each already retried RETRY_MAX times -
+ * before the partner is treated as gone: the peer is removed and the node goes
+ * back to broadcasting HELLO. */
+#define PEER_LOST_AFTER_FAILURES 3
 
 /* ---------------------------------------------------------------------------
  * Optional payload encryption (AES-128-CCM, done by the ESP-NOW stack).
