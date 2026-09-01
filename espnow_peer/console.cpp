@@ -11,12 +11,6 @@
 static char   line[LINE_MAX + 1];
 static size_t lineLen = 0;
 
-static const char *macToStr(const uint8_t *mac) {
-  static char buf[18];
-  snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
-           mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-  return buf;
-}
 
 void consoleHelp() {
   Serial.println();
@@ -62,7 +56,7 @@ static void execute(char *cmd) {
   } else if (!strcasecmp(cmd, "peer")) {
     Serial.printf("[peer] this node %s is %s\n", linkOwnMac(),
                   linkIsPaired() ? "paired" : "unpaired, broadcasting HELLO");
-    if (linkIsPaired()) Serial.printf("[peer] partner %s\n", macToStr(linkPeerMac()));
+    if (linkIsPaired()) Serial.printf("[peer] partner %s\n", linkMacToStr(linkPeerMac()));
 
   } else if (!strcasecmp(cmd, "unpair")) {
     linkUnpair();

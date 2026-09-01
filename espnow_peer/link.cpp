@@ -88,7 +88,7 @@ const char *cmdName(uint8_t cmd) {
   }
 }
 
-static const char *macToStr(const uint8_t *mac) {
+const char *linkMacToStr(const uint8_t *mac) {
   static char buf[18];
   snprintf(buf, sizeof(buf), "%02X:%02X:%02X:%02X:%02X:%02X",
            mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
@@ -111,7 +111,7 @@ static bool registerPeer(const uint8_t *mac, bool encrypted) {
   esp_err_t err = esp_now_add_peer(&peer);
   if (err != ESP_OK) {
     Serial.printf("[err ] esp_now_add_peer(%s) failed: %s\n",
-                  macToStr(mac), esp_err_to_name(err));
+                  linkMacToStr(mac), esp_err_to_name(err));
     return false;
   }
   return true;
@@ -125,7 +125,7 @@ static void adoptPeer(const uint8_t *mac) {
   peerKnown  = true;
   lastRxSeq  = 0;
   dropStreak = 0;
-  Serial.printf("[link] paired with %s\n", macToStr(mac));
+  Serial.printf("[link] paired with %s\n", linkMacToStr(mac));
   ledBlink(2);
 }
 
@@ -384,7 +384,7 @@ static void drainRx() {
 static void serviceTimers() {
   if (peerKnown && dropStreak >= PEER_LOST_AFTER_FAILURES) {
     Serial.printf("[link] lost %s after %lu unacknowledged messages, searching again\n",
-                  macToStr(peerMac), (unsigned long)dropStreak);
+                  linkMacToStr(peerMac), (unsigned long)dropStreak);
     linkUnpair();
     return;
   }
@@ -453,7 +453,7 @@ bool linkSendData(float value) {
   payload_data_t d = { value };
   if (!enqueue(MSG_DATA, &d, sizeof(d), true)) return false;
   Serial.printf("[send] DATA seq=%lu value=%.2f -> %s\n",
-                (unsigned long)txSeq, value, macToStr(peerMac));
+                (unsigned long)txSeq, value, linkMacToStr(peerMac));
   return true;
 }
 
@@ -462,7 +462,7 @@ bool linkSendText(const char *text) {
   if (len == 0) return false;
   if (!enqueue(MSG_TEXT, text, (uint8_t)len, true)) return false;
   Serial.printf("[send] TEXT seq=%lu -> %s: %s\n",
-                (unsigned long)txSeq, macToStr(peerMac), text);
+                (unsigned long)txSeq, linkMacToStr(peerMac), text);
   return true;
 }
 
@@ -470,7 +470,7 @@ bool linkSendCommand(uint8_t cmd, uint8_t arg) {
   payload_cmd_t c = { cmd, arg };
   if (!enqueue(MSG_CMD, &c, sizeof(c), true)) return false;
   Serial.printf("[send] CMD seq=%lu -> %s: %s\n",
-                (unsigned long)txSeq, macToStr(peerMac), cmdName(cmd));
+                (unsigned long)txSeq, linkMacToStr(peerMac), cmdName(cmd));
   return true;
 }
 
@@ -509,7 +509,7 @@ void linkPrintStats() {
   Serial.println();
   Serial.printf("--- node %s ---------------------------------\n", NODE_NAME);
   Serial.printf("  mac         : %s\n", linkOwnMac());
-  Serial.printf("  peer        : %s\n", peerKnown ? macToStr(peerMac) : "none, searching");
+  Serial.printf("  peer        : %s\n", peerKnown ? linkMacToStr(peerMac) : "none, searching");
   Serial.printf("  channel     : %d\n", ESPNOW_CHANNEL);
   Serial.printf("  auto send   : %s every %lums\n",
                 autoSend ? "on" : "off", (unsigned long)sendInterval);

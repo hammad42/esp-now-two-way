@@ -36,6 +36,7 @@ bool linkSendCommand(uint8_t cmd, uint8_t arg);
 bool           linkIsPaired();
 const uint8_t *linkPeerMac();
 const char    *linkOwnMac();
+const char    *linkMacToStr(const uint8_t *mac);   /* shared formatter, static buffer */
 void           linkUnpair();
 
 void     linkSetAutoSend(bool on);
