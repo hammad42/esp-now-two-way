@@ -5,6 +5,9 @@
  * Each node periodically sends a DATA frame to its partner, the partner replies
  * with an ACK, and the original sender prints the measured round-trip time.
  *
+ * Received frames are queued by the ESP-NOW callback and handled from loop(),
+ * so nothing slow ever runs inside the Wi-Fi task.
+ *
  * Board: ESP32 / ESP32-S2 / ESP32-S3 / ESP32-C3  (Arduino-ESP32 core 2.x or 3.x)
  * Serial monitor: 115200 baud
  */
@@ -12,8 +15,19 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/queue.h>
 
 #include "peer_config.h"
+
+/* Older cores do not define these; keep the #if guards below well formed. */
+#ifndef ESP_ARDUINO_VERSION_MAJOR
+#define ESP_ARDUINO_VERSION_MAJOR 2
+#endif
+#ifndef ESP_ARDUINO_VERSION
+#define ESP_ARDUINO_VERSION 0
+#define ESP_ARDUINO_VERSION_VAL(a, b, c) 0
+#endif
 
 /* -------------------------------------------------------------------------
  * Wire format - see docs/PROTOCOL.md
@@ -35,10 +49,24 @@ typedef struct __attribute__((packed)) {
   char     name[8];      /* NODE_NAME of the sender, NUL padded           */
 } espnow_message_t;      /* 22 bytes; ESP-NOW allows up to 250            */
 
+/* One received frame, passed from the Wi-Fi task to loop(). */
+typedef struct {
+  uint8_t          mac[6];
+  espnow_message_t msg;
+} rx_item_t;
+
+#define RX_QUEUE_DEPTH 10
+#define LED_BLINK_MS   20
+
 /* -------------------------------------------------------------------------
  * State
+ *
+ * Each counter has exactly one writer: txOk/txFail/rxDropped are written by
+ * ESP-NOW callbacks, everything else only by loop().
  * ---------------------------------------------------------------------- */
 static const uint8_t BROADCAST_ADDR[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
+
+static QueueHandle_t rxQueue = nullptr;
 
 static uint8_t  peerMac[6];
 static bool     peerKnown  = false;
@@ -46,9 +74,13 @@ static uint32_t txSeq      = 0;
 static uint32_t lastSendMs = 0;
 static uint32_t sentAtMs   = 0;   /* timestamp of the DATA frame awaiting an ACK */
 
-static struct {
-  uint32_t sent, delivered, failed, received, acked;
-} stats = { 0, 0, 0, 0, 0 };
+static uint32_t dataTx = 0, dataRx = 0, ackRx = 0;
+static volatile uint32_t txOk = 0, txFail = 0, rxDropped = 0;
+static volatile uint32_t txFailStreak = 0;   /* consecutive radio failures */
+
+#if STATUS_LED_PIN >= 0
+static uint32_t ledOffAtMs = 0;
+#endif
 
 /* -------------------------------------------------------------------------
  * Helpers
@@ -60,6 +92,8 @@ static const char *macToStr(const uint8_t *mac) {
   return buf;
 }
 
+/* Adds mac to the peer table if it is not there already. A frame can only be
+ * sent to a registered peer, including the broadcast address. */
 static bool registerPeer(const uint8_t *mac, bool encrypted) {
   if (esp_now_is_peer_exist(mac)) return true;
 
@@ -74,17 +108,21 @@ static bool registerPeer(const uint8_t *mac, bool encrypted) {
 
   esp_err_t err = esp_now_add_peer(&peer);
   if (err != ESP_OK) {
-    Serial.printf("[err ] esp_now_add_peer(%s) failed: %d\n", macToStr(mac), err);
+    Serial.printf("[err ] esp_now_add_peer(%s) failed: %s\n",
+                  macToStr(mac), esp_err_to_name(err));
     return false;
   }
   return true;
 }
 
+/* Registers the sender and, the first time round, keeps it as our partner. */
 static void adoptPeer(const uint8_t *mac) {
-  if (peerKnown) return;
   if (!registerPeer(mac, ENABLE_ENCRYPTION)) return;
+  if (peerKnown) return;
+
   memcpy(peerMac, mac, 6);
   peerKnown = true;
+  txFailStreak = 0;
   Serial.printf("[link] paired with %s\n", macToStr(mac));
 }
 
@@ -99,66 +137,52 @@ static void sendMessage(const uint8_t *mac, uint8_t type, uint32_t seq) {
   strncpy(msg.name, NODE_NAME, sizeof(msg.name) - 1);
 
   esp_err_t err = esp_now_send(mac, (const uint8_t *)&msg, sizeof(msg));
-  if (err != ESP_OK) Serial.printf("[err ] esp_now_send failed: %d\n", err);
-  else if (type == MSG_DATA) stats.sent++;
+  if (err != ESP_OK) Serial.printf("[err ] esp_now_send failed: %s\n", esp_err_to_name(err));
+  else if (type == MSG_DATA) dataTx++;
 }
 
-static void blinkLed() {
+static void ledOn() {
 #if STATUS_LED_PIN >= 0
   digitalWrite(STATUS_LED_PIN, HIGH);
-  delay(10);
-  digitalWrite(STATUS_LED_PIN, LOW);
+  ledOffAtMs = millis() + LED_BLINK_MS;
+#endif
+}
+
+static void serviceLed() {
+#if STATUS_LED_PIN >= 0
+  if (ledOffAtMs && (int32_t)(millis() - ledOffAtMs) >= 0) {
+    digitalWrite(STATUS_LED_PIN, LOW);
+    ledOffAtMs = 0;
+  }
 #endif
 }
 
 /* -------------------------------------------------------------------------
  * ESP-NOW callbacks
  *
- * The callback signatures changed across Arduino-ESP32 core releases, so the
- * real work lives in onSendResult()/onMessage() and the version-specific
- * wrappers below only forward to them.
+ * These run in the Wi-Fi task, so they only touch counters and the queue -
+ * no Serial, no delay(), no esp_now_send(). The callback signatures changed
+ * across Arduino-ESP32 releases, so the wrappers at the bottom adapt them.
  * ---------------------------------------------------------------------- */
 static void onSendResult(esp_now_send_status_t status) {
   if (status == ESP_NOW_SEND_SUCCESS) {
-    stats.delivered++;
+    txOk++;
+    txFailStreak = 0;
   } else {
-    stats.failed++;
-    Serial.println("[warn] frame not acknowledged by the radio layer");
+    txFail++;
+    txFailStreak++;
   }
 }
 
 static void onMessage(const uint8_t *src, const uint8_t *data, int len) {
   if (len != (int)sizeof(espnow_message_t)) return;   /* not one of ours */
 
-  espnow_message_t msg;
-  memcpy(&msg, data, sizeof(msg));
-  if (msg.version != PROTO_VERSION) return;
+  rx_item_t item;
+  memcpy(item.mac, src, 6);
+  memcpy(&item.msg, data, sizeof(item.msg));
+  if (item.msg.version != PROTO_VERSION) return;
 
-  blinkLed();
-
-  switch (msg.type) {
-    case MSG_HELLO:
-      adoptPeer(src);
-      /* Answer so the other side learns our MAC as well. */
-      sendMessage(BROADCAST_ADDR, MSG_HELLO, 0);
-      break;
-
-    case MSG_DATA:
-      stats.received++;
-      adoptPeer(src);
-      Serial.printf("[recv] from %s seq=%lu uptime=%lums value=%.2f\n",
-                    msg.name, (unsigned long)msg.seq,
-                    (unsigned long)msg.uptime_ms, msg.value);
-      sendMessage(src, MSG_ACK, msg.seq);
-      break;
-
-    case MSG_ACK:
-      stats.acked++;
-      Serial.printf("[ ack] seq=%lu rtt=%lums\n",
-                    (unsigned long)msg.seq,
-                    (unsigned long)(millis() - sentAtMs));
-      break;
-  }
+  if (!rxQueue || xQueueSend(rxQueue, &item, 0) != pdTRUE) rxDropped++;
 }
 
 #if ESP_ARDUINO_VERSION >= ESP_ARDUINO_VERSION_VAL(3, 2, 0)
@@ -182,6 +206,78 @@ static void recvCb(const uint8_t *mac, const uint8_t *data, int len) {
 #endif
 
 /* -------------------------------------------------------------------------
+ * Frame handling, running in loop() context
+ * ---------------------------------------------------------------------- */
+static void handleFrame(const uint8_t *src, espnow_message_t &msg) {
+  msg.name[sizeof(msg.name) - 1] = '\0';   /* the sender may not have terminated it */
+  ledOn();
+
+  switch (msg.type) {
+    case MSG_HELLO: {
+      const bool alreadyPaired = peerKnown;
+      adoptPeer(src);
+      /* Answer once, and only to a peer we did not already know: replying to
+       * every HELLO makes two nodes bounce HELLOs off each other forever. */
+      if (!alreadyPaired && peerKnown) sendMessage(src, MSG_HELLO, 0);
+      break;
+    }
+
+    case MSG_DATA:
+      dataRx++;
+      adoptPeer(src);
+      Serial.printf("[recv] from %s seq=%lu uptime=%lums value=%.2f\n",
+                    msg.name, (unsigned long)msg.seq,
+                    (unsigned long)msg.uptime_ms, msg.value);
+      sendMessage(src, MSG_ACK, msg.seq);
+      break;
+
+    case MSG_ACK:
+      ackRx++;
+      if (msg.seq == txSeq) {
+        Serial.printf("[ ack] seq=%lu rtt=%lums\n",
+                      (unsigned long)msg.seq,
+                      (unsigned long)(millis() - sentAtMs));
+      } else {
+        Serial.printf("[ ack] seq=%lu (late, no rtt)\n", (unsigned long)msg.seq);
+      }
+      break;
+  }
+}
+
+static void drainRxQueue() {
+  rx_item_t item;
+  while (rxQueue && xQueueReceive(rxQueue, &item, 0) == pdTRUE) {
+    handleFrame(item.mac, item.msg);
+  }
+}
+
+static void serviceLink() {
+  /* A partner that stops acknowledging is dropped, and we look for one again. */
+  if (peerKnown && txFailStreak >= PEER_LOST_AFTER_FAILURES) {
+    Serial.printf("[link] lost %s after %lu failed frames, searching again\n",
+                  macToStr(peerMac), (unsigned long)txFailStreak);
+    esp_now_del_peer(peerMac);
+    peerKnown = false;
+    txFailStreak = 0;
+  }
+
+  if (millis() - lastSendMs < SEND_INTERVAL_MS) return;
+  lastSendMs = millis();
+
+  if (!peerKnown) {
+    sendMessage(BROADCAST_ADDR, MSG_HELLO, 0);   /* keep looking for a partner */
+    return;
+  }
+
+  sentAtMs = millis();
+  sendMessage(peerMac, MSG_DATA, ++txSeq);
+  Serial.printf("[send] seq=%lu -> %s | data tx %lu rx %lu ack %lu | radio ok %lu fail %lu drop %lu\n",
+                (unsigned long)txSeq, macToStr(peerMac),
+                (unsigned long)dataTx, (unsigned long)dataRx, (unsigned long)ackRx,
+                (unsigned long)txOk, (unsigned long)txFail, (unsigned long)rxDropped);
+}
+
+/* -------------------------------------------------------------------------
  * Setup / loop
  * ---------------------------------------------------------------------- */
 void setup() {
@@ -203,6 +299,13 @@ void setup() {
   Serial.printf("MAC     : %s\n", WiFi.macAddress().c_str());
   Serial.printf("Channel : %d\n", ESPNOW_CHANNEL);
 
+  rxQueue = xQueueCreate(RX_QUEUE_DEPTH, sizeof(rx_item_t));
+  if (!rxQueue) {
+    Serial.println("[fatal] cannot allocate the receive queue, restarting");
+    delay(1000);
+    ESP.restart();
+  }
+
   if (esp_now_init() != ESP_OK) {
     Serial.println("[fatal] esp_now_init() failed, restarting");
     delay(1000);
@@ -217,8 +320,7 @@ void setup() {
   esp_now_register_send_cb(sendCb);
   esp_now_register_recv_cb(recvCb);
 
-  /* The broadcast address has to be a registered peer before it can be used. */
-  registerPeer(BROADCAST_ADDR, false);
+  registerPeer(BROADCAST_ADDR, false);   /* needed before any HELLO can go out */
 
 #if PEER_AUTO_DISCOVER
   Serial.println("Peer    : searching...");
@@ -229,19 +331,7 @@ void setup() {
 }
 
 void loop() {
-  if (millis() - lastSendMs < SEND_INTERVAL_MS) return;
-  lastSendMs = millis();
-
-  if (!peerKnown) {
-    sendMessage(BROADCAST_ADDR, MSG_HELLO, 0);   /* keep looking for a partner */
-    return;
-  }
-
-  sentAtMs = millis();
-  sendMessage(peerMac, MSG_DATA, ++txSeq);
-  Serial.printf("[send] seq=%lu -> %s  (tx %lu ok %lu fail %lu | rx %lu ack %lu)\n",
-                (unsigned long)txSeq, macToStr(peerMac),
-                (unsigned long)stats.sent, (unsigned long)stats.delivered,
-                (unsigned long)stats.failed, (unsigned long)stats.received,
-                (unsigned long)stats.acked);
+  drainRxQueue();
+  serviceLed();
+  serviceLink();
 }

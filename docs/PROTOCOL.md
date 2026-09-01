@@ -23,8 +23,14 @@ keeps unrelated ESP-NOW traffic on the same channel out of the way.
 ## Message types
 
 **HELLO (0)** — sent to `FF:FF:FF:FF:FF:FF` while no peer is known, once per
-`SEND_INTERVAL_MS`. A node that receives a HELLO registers the sender as its peer and
-replies with its own HELLO, so both sides are paired after one exchange. `seq` is unused.
+`SEND_INTERVAL_MS`. A node that receives a HELLO registers the sender as its peer, and
+replies with a unicast HELLO **only if it was not already paired**. That condition is
+what terminates the exchange: an unconditional reply leaves the two nodes answering each
+other's HELLOs forever. `seq` is unused.
+
+If a node that is already paired hears a HELLO from a partner that rebooted, it stays
+silent — and the rebooted node re-pairs anyway from the next DATA frame it receives,
+since DATA also registers its sender.
 
 **DATA (1)** — unicast to the paired peer, `seq` incrementing from 1. Carries `value`
 and `uptime_ms`.
@@ -36,8 +42,9 @@ its send timestamp from `millis()` on arrival to get the round-trip time.
 
 ```
 A                                   B
-|--- HELLO (broadcast) ------------>|   B registers A
-|<-- HELLO (broadcast) -------------|   A registers B
+|--- HELLO (broadcast) ------------>|   B registers A, was unpaired -> replies
+|<-- HELLO (unicast) ---------------|   A registers B, was unpaired -> replies
+|--- HELLO (unicast) -------------->|   B is already paired -> silent, exchange ends
 |                                   |
 |--- DATA seq=1 ------------------->|
 |<-- ACK  seq=1 --------------------|   A prints rtt
@@ -62,6 +69,13 @@ There are two separate notions of "delivered":
 Neither is retried. A lost DATA frame simply leaves a gap in the sequence numbers, which
 is visible in the log. If your application needs reliability, retransmit on a missing ACK
 and de-duplicate on `seq` at the receiver.
+
+Radio failures are counted consecutively: `PEER_LOST_AFTER_FAILURES` in a row and the
+node deletes the peer and goes back to discovery. A single success resets the count.
+
+The round-trip time is only printed when the ACK matches the most recent DATA sequence;
+a late ACK arriving after the next DATA has gone out is logged without a timing figure,
+because the sketch keeps one send timestamp rather than one per outstanding frame.
 
 ## Extending it
 

@@ -56,7 +56,7 @@ MAC     : 24:6F:28:AE:11:04
 Channel : 1
 Peer    : searching...
 [link] paired with 3C:61:05:12:9B:70
-[send] seq=1 -> 3C:61:05:12:9B:70  (tx 1 ok 1 fail 0 | rx 0 ack 0)
+[send] seq=1 -> 3C:61:05:12:9B:70 | data tx 1 rx 0 ack 0 | radio ok 1 fail 0 drop 0
 [ ack] seq=1 rtt=4ms
 [recv] from B seq=1 uptime=6120ms value=24.13
 ```
@@ -71,8 +71,9 @@ Everything tunable lives in [`espnow_peer/peer_config.h`](espnow_peer/peer_confi
 | `ESPNOW_CHANNEL` | `1` | Wi-Fi channel; must match on both boards |
 | `SEND_INTERVAL_MS` | `2000` | Transmit period |
 | `PEER_AUTO_DISCOVER` | `1` | `0` uses the fixed `PEER_MAC_ADDRESS` instead |
+| `PEER_LOST_AFTER_FAILURES` | `5` | Undelivered frames in a row before the node re-runs discovery |
 | `ENABLE_ENCRYPTION` | `0` | `1` turns on AES-128-CCM for unicast traffic |
-| `STATUS_LED_PIN` | `LED_BUILTIN` | Blinks on receive; `-1` disables |
+| `STATUS_LED_PIN` | `2` | Blinks on receive; `-1` disables |
 
 To pin the peer manually, flash
 [`tools/get_mac_address`](tools/get_mac_address/get_mac_address.ino) to one board, copy
@@ -91,6 +92,13 @@ the printed line into the other board's `PEER_MAC_ADDRESS`, and set
   to the peer's radio, not proof the application handled it. The application-level
   `MSG_ACK` reply is what proves an end-to-end round trip, and it is what the RTT figure
   is measured from.
+- The receive callback runs **in the Wi-Fi task**, so it only copies the frame into a
+  FreeRTOS queue and returns. All the slow work — printing, replying, blinking — happens
+  in `loop()`. Sending or blocking inside that callback stalls the Wi-Fi stack.
+- A HELLO is answered **once, and only by a node that did not already know the sender**.
+  Replying to every HELLO makes two nodes bounce broadcasts off each other indefinitely.
+- If `PEER_LOST_AFTER_FAILURES` frames in a row go undelivered, the peer is dropped and
+  the node returns to broadcasting HELLO, so a partner that reboots is picked up again.
 - Callback signatures changed between Arduino-ESP32 2.x, 3.0 and 3.2; the sketch adapts
   with `ESP_ARDUINO_VERSION` guards so it compiles on all three.
 
@@ -113,8 +121,9 @@ docs/
 | Symptom | Likely cause |
 | --- | --- |
 | Stuck on `Peer : searching...` | Boards on different `ESPNOW_CHANNEL`, or only one board powered |
-| `frame not acknowledged by the radio layer` | Peer out of range, asleep, or reset; the peer MAC is stale |
-| `esp_now_add_peer failed: 12` (`ESP_ERR_ESPNOW_FULL`) | More than 20 peers registered |
+| `radio fail` climbing, then `link lost ... searching again` | Peer out of range, asleep or reset — the node re-runs discovery on its own |
+| `esp_now_add_peer failed: ESP_ERR_ESPNOW_FULL` | Peer table full: 20 peers, of which 6 encrypted |
+| `drop` counter rising | Frames arriving faster than `loop()` drains them; raise `RX_QUEUE_DEPTH` |
 | Nothing on the serial monitor | Wrong baud rate — it must be 115200 |
 | Works, then stops when Wi-Fi is used | Connecting to an AP moves the radio to the AP's channel; put both boards on that channel |
 | Encrypted build never pairs | `ENABLE_ENCRYPTION` or the keys differ between boards; keys must be exactly 16 bytes |

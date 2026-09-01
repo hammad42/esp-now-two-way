@@ -31,6 +31,10 @@
 #define PEER_AUTO_DISCOVER 1
 #define PEER_MAC_ADDRESS { 0x24, 0x6F, 0x28, 0x00, 0x00, 0x00 }
 
+/* Consecutive frames the radio fails to deliver before the partner is treated
+ * as gone: the peer is removed and the node goes back to broadcasting HELLO. */
+#define PEER_LOST_AFTER_FAILURES 5
+
 /* ---------------------------------------------------------------------------
  * Optional payload encryption (AES-128-CCM, done by the ESP-NOW stack).
  * Set to 1 on BOTH boards and change the keys. Keys must be exactly 16 bytes.
@@ -41,10 +45,9 @@
 #define ESPNOW_PMK "pmk_change_me_16"
 #define ESPNOW_LMK "lmk_change_me_16"
 
-/* Blink the on-board LED on every received frame (set to -1 to disable). */
-#ifndef LED_BUILTIN
-#define LED_BUILTIN 2
-#endif
-#define STATUS_LED_PIN LED_BUILTIN
+/* Blink the on-board LED on every received frame. Use a plain GPIO number so
+ * the value works in #if; 2 is the on-board LED on most ESP32 dev boards.
+ * Set to -1 to disable (boards whose only LED is an addressable RGB one). */
+#define STATUS_LED_PIN 2
 
 #endif /* PEER_CONFIG_H */
